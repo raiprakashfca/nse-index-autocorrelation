@@ -1,32 +1,68 @@
 import os
+import re
 import json
+import math
 import datetime as dt
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple
 
-import streamlit as st
+import numpy as np
+import pandas as pd
 import pytz
+import streamlit as st
 import gspread
 from kiteconnect import KiteConnect
 
+
+# ============================
+# CONFIG
+# ============================
 IST = pytz.timezone("Asia/Kolkata")
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(page_title="nse-index-autocorrelation", page_icon="📈", layout="wide")
+# Liquid NSE index-derivative underlyings (NFO index options universe)
+INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
+
+HORIZON_BARS = {
+    "30 min": 6,    # 6 x 5m
+    "60 min": 12,   # 12 x 5m
+}
+
+DEFAULTS = {
+    "lookback_days": 60,
+    "impulse_bars": 2,          # how many recent 5m bars define "impulse"
+    "min_n": 40,                # min samples per bucket
+    "min_abs_corr": 0.06,       # min absolute correlation
+    "min_t": 2.0,               # min absolute t-stat
+    "refresh_sec": 30,
+    "prefer_itm": True,         # option suggestion: 1-step ITM vs ATM
+}
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def get_cfg(key: str, default: str | None = None) -> str | None:
-    if hasattr(st, "secrets") and key in st.secrets:
-        v = str(st.secrets[key])
-        return v.strip() if isinstance(v, str) else v
-    v = os.environ.get(key, default)
-    return v.strip() if isinstance(v, str) else v
+# ============================
+# PAGE CONFIG (only once)
+# ============================
+st.set_page_config(
+    page_title="nse-index-autocorrelation",
+    page_icon="📈",
+    layout="wide",
+)
+
+
+# ============================
+# HELPERS
+# ============================
+def ist_now() -> dt.datetime:
+    return dt.datetime.now(tz=IST)
 
 def ist_now_str() -> str:
-    return dt.datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S")
+    return ist_now().strftime("%Y-%m-%d %H:%M:%S")
+
+def get_cfg(key: str, default: Optional[str] = None) -> Optional[str]:
+    if hasattr(st, "secrets") and key in st.secrets:
+        v = str(st.secrets[key])
+        return v.strip()
+    v = os.environ.get(key, default)
+    return v.strip() if isinstance(v, str) else v
 
 def get_query_params() -> dict:
     try:
@@ -43,38 +79,90 @@ def clear_query_params():
 def normalize_qp(v):
     return v[0] if isinstance(v, (list, tuple)) else v
 
+def safe_sign(x: float) -> int:
+    if pd.isna(x) or abs(x) < 1e-12:
+        return 0
+    return 1 if x > 0 else -1
 
-# ----------------------------
-# Google Sheets
-# ----------------------------
+def corr_t_stat(r: float, n: int) -> float:
+    if n <= 2 or pd.isna(r) or abs(r) >= 1:
+        return np.nan
+    return float(r * math.sqrt((n - 2) / (1 - r * r)))
+
+def market_is_open_ist(now: dt.datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+def round_to_step(x: float, step: int) -> int:
+    return int(round(x / step) * step)
+
+def to_ist_datetime_series(s: pd.Series) -> pd.Series:
+    d = pd.to_datetime(s, errors="coerce")
+    # If timezone-naive, localize to IST. If tz-aware, convert to IST.
+    if getattr(d.dt, "tz", None) is None:
+        return d.dt.tz_localize(IST)
+    return d.dt.tz_convert(IST)
+
+
+# ============================
+# SERVICE ACCOUNT JSON HARDENING
+# ============================
+def load_service_account_json(raw: str) -> dict:
+    """
+    Robust parser:
+    - First tries json.loads
+    - If TOML multiline accidentally introduced literal newlines inside private_key string,
+      repair by replacing literal newlines with \\n inside that JSON value.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        fixed = re.sub(
+            r'("private_key"\s*:\s*")(.+?)(")',
+            lambda m: m.group(1) + m.group(2).replace("\n", "\\n") + m.group(3),
+            raw,
+            flags=re.S,
+        )
+        return json.loads(fixed)
+
+
+# ============================
+# GOOGLE SHEETS
+# ============================
 def get_gspread_client():
     sa_json = get_cfg("GCP_SERVICE_ACCOUNT_JSON")
     if not sa_json:
         raise RuntimeError("Missing GCP_SERVICE_ACCOUNT_JSON in Streamlit secrets.")
-    sa_dict = json.loads(sa_json)
+    sa_dict = load_service_account_json(sa_json)
     return gspread.service_account_from_dict(sa_dict)
 
-def upsert_worksheet(sh, title: str, rows: int = 2000, cols: int = 20):
+def upsert_worksheet(sh, title: str, rows: int = 2000, cols: int = 30):
     try:
         return sh.worksheet(title)
     except Exception:
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
-def ensure_headers(ws, headers: list[str]):
+def ensure_headers(ws, headers: List[str]):
     existing = ws.row_values(1)
     if existing[: len(headers)] != headers:
         ws.update("A1", [headers])
 
 @st.cache_data(ttl=10, show_spinner=False)
-def read_tokenstore() -> dict:
+def read_tokenstore_from_sheet() -> dict:
     """
-    Reads ZerodhaTokenStore A1:D1:
-      A1=API Key, B1=API Secret, C1=Access Token, D1=Timestamp
+    Reads TOKENSTORE_TAB (default: Sheet1) A1:D1:
+      A1 = API Key
+      B1 = API Secret
+      C1 = Access Token
+      D1 = Timestamp (optional)
     """
     out = {"api_key": None, "api_secret": None, "access_token": None, "ts": None, "status": "skipped", "error": ""}
 
     gs_id = get_cfg("GSHEET_ID")
-    tab = get_cfg("TOKENSTORE_TAB", "ZerodhaTokenStore")
+    store_tab = get_cfg("TOKENSTORE_TAB", "Sheet1")
+
     if not gs_id:
         out["error"] = "Missing GSHEET_ID in secrets."
         return out
@@ -82,11 +170,11 @@ def read_tokenstore() -> dict:
     try:
         gc = get_gspread_client()
         sh = gc.open_by_key(gs_id)
-        ws = sh.worksheet(tab)
+        ws = sh.worksheet(store_tab)
         row = ws.get("A1:D1")
         if not row or not row[0]:
             out["status"] = "empty"
-            out["error"] = "ZerodhaTokenStore A1:D1 is empty."
+            out["error"] = f"{store_tab} A1:D1 is empty."
             return out
 
         vals = row[0] + ["", "", "", ""]
@@ -102,18 +190,20 @@ def read_tokenstore() -> dict:
         out["error"] = str(e)
         return out
 
-def write_token_to_sheets(access_token: str, user_id: str = "") -> str:
+def write_access_token_logs(access_token: str, user_id: str = "") -> str:
     """
-    Updates:
-      - ZerodhaTokenStore: C1 token, D1 timestamp
-      - AccessTokenLog: append row
+    - Writes token to TOKENSTORE_TAB: C1 token, D1 timestamp
+    - Appends token to TOKENLOG_TAB (AccessTokenLog)
     """
     gs_id = get_cfg("GSHEET_ID")
-    store_tab = get_cfg("TOKENSTORE_TAB", "ZerodhaTokenStore")
+    store_tab = get_cfg("TOKENSTORE_TAB", "Sheet1")
     log_tab = get_cfg("TOKENLOG_TAB", "AccessTokenLog")
 
     if not gs_id:
         return "Sheets write skipped (GSHEET_ID missing)."
+
+    if store_tab == log_tab:
+        raise RuntimeError("Misconfig: TOKENSTORE_TAB and TOKENLOG_TAB cannot be the same tab.")
 
     gc = get_gspread_client()
     sh = gc.open_by_key(gs_id)
@@ -125,49 +215,335 @@ def write_token_to_sheets(access_token: str, user_id: str = "") -> str:
     ensure_headers(ws_log, ["TimestampIST", "AccessToken", "UserID", "App"])
     ws_log.append_row([ist_now_str(), access_token, user_id, "nse-index-autocorrelation"], value_input_option="RAW")
 
-    # bust cache so the sidebar shows latest immediately
-    read_tokenstore.clear()
+    read_tokenstore_from_sheet.clear()
     return f"Updated {store_tab} (C1/D1) + appended to {log_tab}."
 
+def append_signal_log(row: List, headers: List[str]) -> str:
+    """
+    Appends a signal snapshot row to SIGNALLOG_TAB (default: SignalLog)
+    """
+    gs_id = get_cfg("GSHEET_ID")
+    sig_tab = get_cfg("SIGNALLOG_TAB", "SignalLog")
 
-# ----------------------------
-# Token validation
-# ----------------------------
-def validate_token(api_key: str, access_token: str) -> tuple[bool, dict | None, str]:
+    if not gs_id:
+        return "Signal log skipped (GSHEET_ID missing)."
+
+    gc = get_gspread_client()
+    sh = gc.open_by_key(gs_id)
+    ws = upsert_worksheet(sh, sig_tab)
+
+    ensure_headers(ws, headers)
+    ws.append_row(row, value_input_option="RAW")
+    return f"Signal logged to {sig_tab}."
+
+
+# ============================
+# KITE HELPERS
+# ============================
+def kite_client(api_key: str, access_token: str) -> KiteConnect:
+    k = KiteConnect(api_key=api_key)
+    k.set_access_token(access_token)
+    return k
+
+def validate_token(api_key: str, access_token: str) -> Tuple[bool, Optional[dict], str]:
     try:
-        kite = KiteConnect(api_key=api_key)
-        kite.set_access_token(access_token)
-        prof = kite.profile()  # raises if invalid
+        k = kite_client(api_key, access_token)
+        prof = k.profile()
         return True, prof, ""
     except Exception as e:
         return False, None, str(e)
 
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_instruments(api_key: str, access_token: str) -> pd.DataFrame:
+    k = kite_client(api_key, access_token)
+    inst = k.instruments()
+    df = pd.DataFrame(inst)
+
+    if "expiry" in df.columns:
+        df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce").dt.date
+    if "strike" in df.columns:
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    return df
+
+def resolve_index_token(df_inst: pd.DataFrame, underlying: str) -> int:
+    """
+    More deterministic mapping for index instruments.
+    """
+    mapping_candidates = {
+        "NIFTY": ["NIFTY 50", "NIFTY50", "NIFTY"],
+        "BANKNIFTY": ["NIFTY BANK", "BANKNIFTY", "BANK NIFTY"],
+        "FINNIFTY": ["NIFTY FIN SERVICE", "FINNIFTY", "NIFTY FIN"],
+        "MIDCPNIFTY": ["NIFTY MID SELECT", "MIDCPNIFTY", "MID SELECT", "MIDCAP"],
+        "NIFTYNXT50": ["NIFTY NEXT 50", "NIFTYNXT50", "NEXT 50"],
+    }.get(underlying.upper(), [underlying.upper()])
+
+    idx = df_inst[(df_inst["exchange"] == "NSE")].copy()
+    idx["tradingsymbol_u"] = idx["tradingsymbol"].astype(str).str.upper()
+
+    # try direct matches first
+    for c in mapping_candidates:
+        hit = idx[idx["tradingsymbol_u"] == c.upper()]
+        if not hit.empty:
+            return int(hit.iloc[0]["instrument_token"])
+
+    # fallback: contains match, prefer INDICES segment if present
+    idx["segment_u"] = idx["segment"].astype(str).str.upper()
+    idx2 = idx[idx["segment_u"].str.contains("IND", na=False) | idx["segment_u"].str.contains("INDICES", na=False)]
+    search_space = idx2 if not idx2.empty else idx
+
+    best_score = -1
+    best_token = None
+    for _, r in search_space.iterrows():
+        ts = str(r["tradingsymbol"]).upper()
+        score = 0
+        for c in mapping_candidates:
+            cu = c.upper()
+            if cu in ts:
+                score += 10
+            if ts == cu:
+                score += 50
+        # preference for shorter
+        score -= min(len(ts), 60) // 10
+        if score > best_score:
+            best_score = score
+            best_token = int(r["instrument_token"])
+
+    if best_token is None or best_score <= 0:
+        raise RuntimeError(f"Unable to map {underlying} to an NSE index instrument token.")
+    return best_token
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_5m_candles(api_key: str, access_token: str, instrument_token: int, lookback_days: int) -> pd.DataFrame:
+    k = kite_client(api_key, access_token)
+    now = ist_now()
+    from_dt = (now - dt.timedelta(days=lookback_days)).replace(tzinfo=None)
+    to_dt = now.replace(tzinfo=None)
+
+    data = k.historical_data(
+        instrument_token=instrument_token,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval="5minute",
+        continuous=False,
+        oi=False,
+    )
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+
+    df["date"] = to_ist_datetime_series(df["date"])
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df
+
+def infer_strike_step(df_inst: pd.DataFrame, name: str, expiry: dt.date) -> int:
+    opt = df_inst[
+        (df_inst["exchange"] == "NFO")
+        & (df_inst["name"] == name)
+        & (df_inst["expiry"] == expiry)
+        & (df_inst["instrument_type"].isin(["CE", "PE"]))
+        & (df_inst["strike"].notna())
+    ]
+    strikes = np.sort(opt["strike"].unique())
+    if len(strikes) < 5:
+        fallback = {"NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25, "NIFTYNXT50": 50}
+        return int(fallback.get(name, 50))
+
+    diffs = np.diff(strikes)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return 50
+    step = int(np.median(diffs))
+    common = np.array([25, 50, 100])
+    return int(common[np.argmin(np.abs(common - step))])
+
+def pick_option_contract(
+    df_inst: pd.DataFrame,
+    name: str,
+    direction: int,
+    spot: float,
+    prefer_itm: bool,
+) -> Optional[Dict]:
+    opt_type = "CE" if direction > 0 else "PE"
+
+    opt = df_inst[
+        (df_inst["exchange"] == "NFO")
+        & (df_inst["name"] == name)
+        & (df_inst["instrument_type"] == opt_type)
+        & (df_inst["expiry"].notna())
+        & (df_inst["strike"].notna())
+    ].copy()
+
+    if opt.empty:
+        return None
+
+    today = ist_now().date()
+    opt = opt[opt["expiry"] >= today]
+    if opt.empty:
+        return None
+
+    expiry = opt["expiry"].min()
+    step = infer_strike_step(df_inst, name, expiry)
+    atm = round_to_step(spot, step)
+
+    strike = (atm - step) if (prefer_itm and opt_type == "CE") else (atm + step) if (prefer_itm and opt_type == "PE") else atm
+
+    pick = opt[(opt["expiry"] == expiry) & (opt["strike"] == float(strike))]
+    if pick.empty:
+        pick2 = opt[opt["expiry"] == expiry].copy()
+        pick2["dist"] = (pick2["strike"] - strike).abs()
+        pick2 = pick2.sort_values(["dist"]).head(1)
+        if pick2.empty:
+            return None
+        return pick2.iloc[0].to_dict()
+
+    return pick.sort_values("tradingsymbol").iloc[0].to_dict()
+
 
 # ============================
-# UI
+# STRATEGY (seasonal autocorr by time bucket)
+# ============================
+@dataclass
+class LiveSignal:
+    bucket: str
+    mode: str
+    direction: int
+    confidence: float
+    corr: float
+    t_stat: float
+    n: int
+    cont_prob: float
+    reason: str
+
+def compute_bucket_stats(df: pd.DataFrame, horizon: int, impulse_bars: int) -> pd.DataFrame:
+    if df.empty or len(df) < (horizon + 60):
+        return pd.DataFrame()
+
+    d = df.copy()
+    d["ret"] = np.log(d["close"]).diff()
+    d["impulse"] = d["ret"].rolling(impulse_bars).sum()
+    d["fwd_ret"] = np.log(d["close"].shift(-horizon) / d["close"])
+    d["bucket"] = d["date"].dt.strftime("%H:%M")
+
+    d = d.dropna(subset=["impulse", "fwd_ret", "bucket"])
+    if d.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for b, g in d.groupby("bucket", sort=True):
+        n = len(g)
+        if n < 10:
+            rows.append({"bucket": b, "n": n, "corr": np.nan, "t_stat": np.nan, "mean_fwd": np.nan, "std_fwd": np.nan, "cont_prob": np.nan})
+            continue
+
+        corr = g["impulse"].corr(g["fwd_ret"])
+        t = corr_t_stat(corr, n)
+
+        s_imp = g["impulse"].apply(safe_sign)
+        s_fwd = g["fwd_ret"].apply(safe_sign)
+        valid = (s_imp != 0) & (s_fwd != 0)
+        cont_prob = float((s_imp[valid] == s_fwd[valid]).mean()) if valid.sum() > 0 else np.nan
+
+        rows.append({
+            "bucket": b,
+            "n": int(n),
+            "corr": float(corr) if pd.notna(corr) else np.nan,
+            "t_stat": float(t) if pd.notna(t) else np.nan,
+            "mean_fwd": float(g["fwd_ret"].mean()),
+            "std_fwd": float(g["fwd_ret"].std(ddof=1)),
+            "cont_prob": cont_prob,
+        })
+
+    s = pd.DataFrame(rows).sort_values("bucket").reset_index(drop=True)
+    s["edge_score"] = (s["corr"].abs() * np.sqrt(s["n"].clip(lower=1))).replace([np.inf, -np.inf], np.nan)
+    return s
+
+def classify_row(row, min_n: int, min_abs_corr: float, min_t: float) -> str:
+    if row["n"] < min_n or pd.isna(row["corr"]) or pd.isna(row["t_stat"]):
+        return "NEUTRAL"
+    if abs(row["corr"]) < min_abs_corr or abs(row["t_stat"]) < min_t:
+        return "NEUTRAL"
+    return "MOMENTUM" if row["corr"] > 0 else "MEAN_REVERSION"
+
+def make_live_signal(
+    df: pd.DataFrame,
+    stats: pd.DataFrame,
+    horizon: int,
+    impulse_bars: int,
+    min_n: int,
+    min_abs_corr: float,
+    min_t: float,
+) -> Optional[LiveSignal]:
+    if df.empty or stats.empty or len(df) < (impulse_bars + 5):
+        return None
+
+    last_bucket = df["date"].iloc[-1].strftime("%H:%M")
+    row = stats[stats["bucket"] == last_bucket]
+    if row.empty:
+        return LiveSignal(last_bucket, "NEUTRAL", 0, 0.0, np.nan, np.nan, 0, np.nan, "Bucket not found in stats (data gap).")
+
+    row = row.iloc[0]
+    mode = classify_row(row, min_n, min_abs_corr, min_t)
+
+    rets = np.log(df["close"]).diff()
+    impulse_val = float(rets.tail(impulse_bars).sum())
+    s_imp = safe_sign(impulse_val)
+
+    if mode == "NEUTRAL" or s_imp == 0:
+        return LiveSignal(
+            bucket=last_bucket,
+            mode="NEUTRAL",
+            direction=0,
+            confidence=0.0,
+            corr=float(row["corr"]) if pd.notna(row["corr"]) else np.nan,
+            t_stat=float(row["t_stat"]) if pd.notna(row["t_stat"]) else np.nan,
+            n=int(row["n"]),
+            cont_prob=float(row["cont_prob"]) if pd.notna(row["cont_prob"]) else np.nan,
+            reason="Neutral bucket / weak evidence / no impulse.",
+        )
+
+    direction = s_imp if mode == "MOMENTUM" else -s_imp
+    t = abs(float(row["t_stat"]))
+    confidence = float(np.clip((t - min_t) / max(0.5, (4.0 - min_t)), 0.0, 1.0))
+
+    return LiveSignal(
+        bucket=last_bucket,
+        mode=mode,
+        direction=direction,
+        confidence=confidence,
+        corr=float(row["corr"]),
+        t_stat=float(row["t_stat"]),
+        n=int(row["n"]),
+        cont_prob=float(row["cont_prob"]) if pd.notna(row["cont_prob"]) else np.nan,
+        reason=f"{mode}: corr={row['corr']:.3f}, t={row['t_stat']:.2f}, n={int(row['n'])}, contP={row['cont_prob']:.2f}" if pd.notna(row["cont_prob"]) else f"{mode}: corr={row['corr']:.3f}, t={row['t_stat']:.2f}, n={int(row['n'])}",
+    )
+
+
+# ============================
+# UI + FLOW
 # ============================
 st.title("📈 nse-index-autocorrelation")
-st.caption("Auth-first flow: uses latest API details & token from Google Sheet before asking for fresh login.")
+st.caption("Signal-only intraday seasonality engine (5m) for NSE index derivatives — audit-first, NO-TRADE by default ✅")
 
-# ---- Read sheet first
-sheet = read_tokenstore()
-
-# ---- Resolve API key/secret priority: Sheet -> Secrets/env
-api_key = (sheet.get("api_key") or get_cfg("KITE_API_KEY") or "").strip()
-api_secret = (sheet.get("api_secret") or get_cfg("KITE_API_SECRET") or "").strip()
-
-# ---- Sidebar
+# --- Sidebar: controls + auth
 with st.sidebar:
-    st.header("🔐 Zerodha Auth")
+    st.header("🔐 Auth (Sheet-first)")
 
-    # Status of sheet
-    st.subheader("Google Sheet Status")
+    sheet = read_tokenstore_from_sheet()
+    api_key = (sheet.get("api_key") or get_cfg("KITE_API_KEY") or "").strip()
+    api_secret = (sheet.get("api_secret") or get_cfg("KITE_API_SECRET") or "").strip()
+
+    store_tab = get_cfg("TOKENSTORE_TAB", "Sheet1")
+    log_tab = get_cfg("TOKENLOG_TAB", "AccessTokenLog")
+
+    if store_tab == log_tab:
+        st.error("Misconfig: TOKENSTORE_TAB and TOKENLOG_TAB cannot be the same tab.")
+        st.stop()
+
+    # Sheet status
     if sheet["status"] == "ok":
         st.success("TokenStore read OK ✅")
-        st.write(f"**Last updated:** `{sheet.get('ts') or '—'}`")
-        st.write(f"**Has API key:** {'✅' if sheet.get('api_key') else '❌'}")
-        st.write(f"**Has API secret:** {'✅' if sheet.get('api_secret') else '❌'}")
-        st.write(f"**Has access token:** {'✅' if sheet.get('access_token') else '❌'}")
+        st.write(f"**Tab:** `{store_tab}`  |  **Last ts:** `{sheet.get('ts') or '—'}`")
+        st.write(f"Has token: {'✅' if sheet.get('access_token') else '❌'}")
     elif sheet["status"] == "empty":
         st.warning("TokenStore empty ⚠️")
         st.caption(sheet["error"])
@@ -181,133 +557,315 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔄 Reload Sheet"):
-            read_tokenstore.clear()
+            read_tokenstore_from_sheet.clear()
             st.rerun()
     with c2:
         if st.button("🧨 Clear Session"):
-            for k in ["kite_access_token", "token_source", "last_request_token", "last_logged_access_token"]:
+            for k in ["kite_access_token", "token_source", "last_request_token", "last_logged_access_token", "last_signal_logged_key"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
-    st.divider()
-
-    # Login link (always visible)
     if not api_key:
-        st.error("API key missing. Put it in ZerodhaTokenStore!A1 or Streamlit Secrets (KITE_API_KEY).")
+        st.error("API key missing. Put it in Sheet1!A1 or Streamlit Secrets (KITE_API_KEY).")
         st.stop()
 
-    kite_for_login = KiteConnect(api_key=api_key)
-    login_url = kite_for_login.login_url()
-    st.markdown(f"👉 **Login to Zerodha:** [{login_url}]({login_url})")
-    st.caption("Only login if the current token is invalid/expired.")
+    # Always show login link
+    kite_login = KiteConnect(api_key=api_key)
+    st.markdown(f"👉 **Login to Zerodha:** [{kite_login.login_url()}]({kite_login.login_url()})")
+    st.caption("If Sheet token is valid, app uses it automatically. Otherwise login generates a new token.")
 
-    st.divider()
-
-    # Manual token is now SAFE (won't overwrite unless you click button)
-    with st.expander("Manual token override (optional)", expanded=False):
-        st.text_input(
-            "Paste token here",
-            key="manual_access_token",
-            type="password",
-            placeholder="Paste access_token if you have it",
-        )
+    with st.expander("Manual token override (safe)", expanded=False):
+        st.text_input("Paste token", key="manual_access_token", type="password", placeholder="Optional")
         if st.button("Use manual token"):
             tok = (st.session_state.get("manual_access_token") or "").strip()
             if tok:
                 st.session_state["kite_access_token"] = tok
                 st.session_state["token_source"] = "Manual"
-                st.success("Manual token loaded into session.")
                 st.rerun()
             else:
-                st.warning("Manual token is empty.")
+                st.warning("Manual token empty.")
 
+    st.divider()
+    st.header("⚙️ Signal Settings")
+    underlying = st.selectbox("Underlying", INDEX_UNDERLYINGS, index=0)
+    horizon_label = st.selectbox("Holding horizon", list(HORIZON_BARS.keys()), index=0)
+    horizon = HORIZON_BARS[horizon_label]
 
-# ---- If sheet has an access token and we don't have one in session, load it
+    lookback_days = st.slider("Lookback days", 20, 140, DEFAULTS["lookback_days"], 5)
+    impulse_bars = st.slider("Impulse bars", 1, 4, DEFAULTS["impulse_bars"], 1)
+
+    st.divider()
+    st.header("🧪 Evidence Filters")
+    min_n = st.slider("Min samples per bucket (n)", 20, 120, DEFAULTS["min_n"], 5)
+    min_abs_corr = st.slider("Min |corr|", 0.02, 0.20, float(DEFAULTS["min_abs_corr"]), 0.01)
+    min_t = st.slider("Min |t-stat|", 1.0, 4.0, float(DEFAULTS["min_t"]), 0.25)
+
+    st.divider()
+    st.header("🧾 Option Suggestion")
+    prefer_itm = st.checkbox("Prefer 1-step ITM", value=DEFAULTS["prefer_itm"])
+
+    st.divider()
+    st.header("🔄 Refresh")
+    refresh_sec = st.slider("Auto refresh (seconds)", 10, 120, DEFAULTS["refresh_sec"], 5)
+
+# auto refresh
+try:
+    st.autorefresh(interval=refresh_sec * 1000, key="__refresh")
+except Exception:
+    pass
+
+# --- Token priority: session -> sheet
 if "kite_access_token" not in st.session_state and sheet.get("access_token"):
     st.session_state["kite_access_token"] = sheet["access_token"]
     st.session_state["token_source"] = "Google Sheet"
 
-# ---- Handle redirect back: request_token -> access_token
+# --- Handle request_token redirect -> generate access_token
 qp = get_query_params()
 request_token = normalize_qp(qp["request_token"]) if "request_token" in qp else None
 
 if request_token and st.session_state.get("last_request_token") != request_token:
     if not api_secret:
-        st.error("API secret missing. Put it in ZerodhaTokenStore!B1 or Streamlit Secrets (KITE_API_SECRET).")
+        st.error("API secret missing. Put it in Sheet1!B1 or Streamlit Secrets (KITE_API_SECRET).")
         st.stop()
 
     st.info("✅ request_token detected. Generating access_token…")
     try:
-        kite_tmp = KiteConnect(api_key=api_key)
-        session = kite_tmp.generate_session(request_token, api_secret=api_secret)
-        new_token = (session.get("access_token") or "").strip()
-
+        tmp = KiteConnect(api_key=api_key)
+        sess = tmp.generate_session(request_token, api_secret=api_secret)
+        new_token = (sess.get("access_token") or "").strip()
         if not new_token:
-            st.error("generate_session succeeded but no access_token returned (unexpected).")
+            st.error("generate_session returned empty access_token (unexpected).")
             st.stop()
 
-        # Put into session first
         st.session_state["kite_access_token"] = new_token
         st.session_state["token_source"] = "Generated via Login"
         st.session_state["last_request_token"] = request_token
         st.session_state["token_generated_at"] = ist_now_str()
 
-        # IMPORTANT: sync widget state so it cannot overwrite the new token
+        # sync widget state so it can't overwrite on rerun
         st.session_state["manual_access_token"] = new_token
 
-        # Clear query params to avoid loops
         clear_query_params()
-
-        st.success("🎯 New access_token generated and loaded.")
+        st.success("🎯 access_token generated.")
     except Exception as e:
         st.error(f"Token generation failed: {e}")
         st.stop()
 
-# ---- Validate current token
+# --- Validate token
 access_token = (st.session_state.get("kite_access_token") or "").strip()
 if not access_token:
-    st.warning("No access token available. Use the login link in the sidebar (or load from sheet).")
+    st.warning("No access token available. Use the login link (or reload sheet).")
     st.stop()
 
 ok, prof, err = validate_token(api_key, access_token)
+if not ok:
+    st.error(f"Auth failed: {err}")
+    st.warning("Use sidebar login link to generate a fresh token.")
+    # clear bad token to prevent loop
+    st.session_state.pop("kite_access_token", None)
+    st.session_state.pop("token_source", None)
+    st.stop()
 
-# ---- Main cards
-left, right = st.columns([2, 3], gap="large")
+user_id = str(prof.get("user_id", ""))
+user_name = prof.get("user_name", "—")
 
-with left:
-    st.subheader("✅ Auth Status")
-    st.write(f"**API key source:** {'Sheet' if sheet.get('api_key') else 'Secrets/Env'}")
+# --- Write token to Sheets once per token
+if st.session_state.get("last_logged_access_token") != access_token:
+    try:
+        msg = write_access_token_logs(access_token, user_id=user_id)
+        st.session_state["last_logged_access_token"] = access_token
+        st.toast(f"🧾 Sheets sync: {msg}")
+    except Exception as e:
+        st.warning(f"Sheets sync failed (auth still OK): {e}")
+
+# ============================
+# MAIN DASHBOARD
+# ============================
+c1, c2, c3, c4 = st.columns([1.25, 1.25, 1.25, 1.25], gap="large")
+now = ist_now()
+with c1:
+    st.subheader("Session")
+    st.write(f"**Now (IST):** {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    st.write(f"**Market:** {'OPEN ✅' if market_is_open_ist(now) else 'CLOSED ⛔'}")
+with c2:
+    st.subheader("Auth")
+    st.write(f"**User:** {user_name} ({user_id})")
     st.write(f"**Token source:** {st.session_state.get('token_source', '—')}")
-    if sheet.get("ts"):
-        st.write(f"**Sheet token timestamp:** `{sheet['ts']}`")
     if st.session_state.get("token_generated_at"):
-        st.write(f"**Generated at:** `{st.session_state['token_generated_at']}`")
-
-    if ok:
-        st.success("Session Active ✅")
-        st.write(f"**User:** {prof.get('user_name', '—')} ({prof.get('user_id', '—')})")
-
-        # Write to Sheets only once per token
-        if st.session_state.get("last_logged_access_token") != access_token:
-            try:
-                msg = write_token_to_sheets(access_token, user_id=str(prof.get("user_id", "")))
-                st.session_state["last_logged_access_token"] = access_token
-                st.success(f"🧾 Sheets sync: {msg}")
-            except Exception as e:
-                st.error(f"Sheets sync failed: {e}")
-    else:
-        st.error(f"Token invalid/expired: {err}")
-        st.warning("Use the sidebar login link to generate a fresh token.")
-        # Clear session token so we don't keep retrying a bad one
-        st.session_state.pop("kite_access_token", None)
-        st.session_state.pop("token_source", None)
-        st.stop()
-
-with right:
-    st.subheader("🔑 Current Access Token")
-    st.caption("Shown for convenience. Also synced to your Google Sheet.")
-    st.code(access_token, language="text")
+        st.write(f"**Generated:** {st.session_state['token_generated_at']}")
+with c3:
+    st.subheader("Config")
+    st.write(f"**Underlying:** {underlying}")
+    st.write(f"**Horizon:** {horizon_label} ({horizon} bars)")
+    st.write(f"**Lookback:** {lookback_days} days")
+with c4:
+    st.subheader("Filters")
+    st.write(f"**min n:** {min_n}")
+    st.write(f"**min |corr|:** {min_abs_corr:.2f}")
+    st.write(f"**min |t|:** {min_t:.2f}")
 
 st.divider()
-st.header("📊 Strategy Output")
-st.info("Auth + sheet-first token flow is stable now. Next: plug in the 5m seasonality engine here.")
+
+# --- Load instruments + candles
+kite = kite_client(api_key, access_token)
+
+with st.spinner("Loading instruments (cached)…"):
+    df_inst = load_instruments(api_key, access_token)
+
+try:
+    idx_token = resolve_index_token(df_inst, underlying)
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+with st.spinner("Fetching 5m candles (cached)…"):
+    df = fetch_5m_candles(api_key, access_token, idx_token, lookback_days)
+
+if df.empty or len(df) < (horizon + 60):
+    st.warning("Not enough candle data. Increase lookback days or try later.")
+    st.stop()
+
+spot = float(df["close"].iloc[-1])
+last_ts = df["date"].iloc[-1]
+
+# --- Compute stats + live signal
+stats = compute_bucket_stats(df, horizon=horizon, impulse_bars=impulse_bars)
+if stats.empty:
+    st.warning("Could not compute bucket stats (insufficient clean data).")
+    st.stop()
+
+stats["mode"] = stats.apply(lambda r: classify_row(r, min_n, min_abs_corr, min_t), axis=1)
+
+signal = make_live_signal(
+    df=df,
+    stats=stats,
+    horizon=horizon,
+    impulse_bars=impulse_bars,
+    min_n=min_n,
+    min_abs_corr=min_abs_corr,
+    min_t=min_t,
+)
+
+# --- Signal KPIs
+k1, k2, k3, k4, k5 = st.columns(5, gap="large")
+k1.metric("Underlying", underlying)
+k2.metric("Last Close", f"{spot:.2f}")
+k3.metric("Last Candle (IST)", last_ts.strftime("%H:%M"))
+
+if signal is None:
+    k4.metric("Signal", "—")
+    k5.metric("Confidence", "—")
+else:
+    sig_txt = "NO TRADE" if signal.direction == 0 else ("BULLISH (CE)" if signal.direction > 0 else "BEARISH (PE)")
+    k4.metric("Signal", sig_txt)
+    k5.metric("Confidence", f"{signal.confidence:.2f}")
+
+st.caption("Signals are generated from completed 5m candles only. Weak buckets → NO TRADE ✅")
+
+left, right = st.columns([1.35, 1.0], gap="large")
+
+# --- Option suggestion + decision card
+with left:
+    st.subheader("🎯 Live Decision (signal-only)")
+
+    opt = None
+    if signal is None:
+        st.info("No signal available.")
+    else:
+        if signal.direction == 0:
+            st.warning("NO TRADE — evidence filters not met for this time bucket.")
+        else:
+            st.success("TRADE BIAS ACTIVE ✅ (signal-only)")
+
+        st.write(f"**Bucket:** `{signal.bucket}`")
+        st.write(f"**Mode:** `{signal.mode}`")
+        st.write(f"**corr:** `{signal.corr:.3f}`  |  **t-stat:** `{signal.t_stat:.2f}`  |  **n:** `{signal.n}`")
+        if pd.notna(signal.cont_prob):
+            st.write(f"**Continuation probability:** `{signal.cont_prob:.2f}`")
+        st.caption(signal.reason)
+
+        if signal.direction != 0:
+            opt = pick_option_contract(df_inst, underlying, signal.direction, spot, prefer_itm=prefer_itm)
+            st.divider()
+            st.subheader("🧾 Suggested Contract (informational)")
+            if opt is None:
+                st.error("Could not resolve an option contract from instrument list.")
+            else:
+                st.write(f"**Tradingsymbol:** `{opt.get('tradingsymbol','—')}`")
+                st.write(f"**Expiry:** `{opt.get('expiry','—')}`  |  **Strike:** `{opt.get('strike','—')}`  |  **Type:** `{opt.get('instrument_type','—')}`")
+                st.write(f"**Token:** `{opt.get('instrument_token','—')}`  |  **Lot:** `{opt.get('lot_size','—')}`")
+                st.caption("No orders are placed. You execute (or ignore).")
+
+    st.divider()
+    st.subheader("📉 Price Context (recent)")
+    tail = df.tail(180)[["date", "close"]].set_index("date")
+    st.line_chart(tail)
+
+# --- Best buckets & full table
+with right:
+    st.subheader("🏆 Best Buckets (edge_score)")
+    top = stats.copy().sort_values("edge_score", ascending=False).head(12)
+    show = top[["bucket", "mode", "n", "corr", "t_stat", "cont_prob", "edge_score"]].copy()
+    show["corr"] = show["corr"].round(3)
+    show["t_stat"] = show["t_stat"].round(2)
+    show["cont_prob"] = show["cont_prob"].round(3)
+    show["edge_score"] = show["edge_score"].round(3)
+    st.dataframe(show, use_container_width=True, height=420)
+
+    st.divider()
+    st.subheader("🧾 Full Bucket Table")
+    full = stats.copy()
+    full["corr"] = full["corr"].round(3)
+    full["t_stat"] = full["t_stat"].round(2)
+    full["cont_prob"] = full["cont_prob"].round(3)
+    full["mean_fwd_bps"] = (full["mean_fwd"] * 10000).round(2)
+    full["std_fwd_bps"] = (full["std_fwd"] * 10000).round(2)
+    st.dataframe(
+        full[["bucket", "mode", "n", "corr", "t_stat", "cont_prob", "mean_fwd_bps", "std_fwd_bps", "edge_score"]],
+        use_container_width=True,
+        height=520,
+    )
+
+st.divider()
+
+# ============================
+# SIGNAL LOGGING (once-per-bucket guard)
+# ============================
+if signal is not None:
+    # key to avoid logging repeatedly on autorefresh
+    log_key = f"{underlying}|{horizon_label}|{signal.bucket}"
+
+    if st.session_state.get("last_signal_logged_key") != log_key:
+        headers = [
+            "TimestampIST", "Underlying", "Horizon", "Bucket",
+            "Signal", "Mode", "Confidence",
+            "Corr", "TStat", "N", "ContinuationProb",
+            "Spot",
+            "SuggestedSymbol", "Expiry", "Strike", "OptionType"
+        ]
+
+        sig_txt = "NO_TRADE" if signal.direction == 0 else ("BULLISH_CE" if signal.direction > 0 else "BEARISH_PE")
+        suggested_symbol = opt.get("tradingsymbol") if isinstance(opt, dict) else ""
+        expiry = str(opt.get("expiry")) if isinstance(opt, dict) else ""
+        strike = opt.get("strike") if isinstance(opt, dict) else ""
+        opt_type = opt.get("instrument_type") if isinstance(opt, dict) else ""
+
+        row = [
+            ist_now_str(), underlying, horizon_label, signal.bucket,
+            sig_txt, signal.mode, round(signal.confidence, 4),
+            round(signal.corr, 6) if pd.notna(signal.corr) else "",
+            round(signal.t_stat, 4) if pd.notna(signal.t_stat) else "",
+            int(signal.n),
+            round(signal.cont_prob, 4) if pd.notna(signal.cont_prob) else "",
+            round(spot, 2),
+            suggested_symbol, expiry, strike, opt_type
+        ]
+
+        try:
+            msg = append_signal_log(row=row, headers=headers)
+            st.session_state["last_signal_logged_key"] = log_key
+            st.caption(f"🧾 {msg}")
+        except Exception as e:
+            st.caption(f"Signal log skipped: {e}")
+
+st.caption("Autocorrelation edges are small & regime-sensitive. Expect lots of NO TRADE buckets. ✅")
