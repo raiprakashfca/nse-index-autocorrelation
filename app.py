@@ -1,7 +1,5 @@
-```python
 # app.py
 # nse-index-autocorrelation — professional auth + sheet-sync + 5m autocorr signals + logging
-# Replace your existing app.py with this file and commit/push.
 
 import os
 import re
