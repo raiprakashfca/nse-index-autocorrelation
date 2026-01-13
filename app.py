@@ -188,12 +188,23 @@ def test_sheet_write():
 
     ping = f"PING {ist_now_str()}"
     ws.update("Z1", [[ping]])
-    back = ws.get("Z1")
-    got = back[0][0] showed = back and back[0] and back[0][0] or ""
-    if str(showed).strip() != ping.strip():
-        raise RuntimeError("Write test failed: could not read back Z1 correctly (range protected / no edit rights?).")
 
-    return {"sheet_title": sh.title, "tab": store_tab, "sa_email": sa_dict.get("client_email", ""), "z1": showed}
+    back = ws.get("Z1")
+    showed = back[0][0] if back and back[0] and len(back[0]) > 0 else ""
+
+    if str(showed).strip() != ping.strip():
+        raise RuntimeError(
+            "Write test failed: could not read back Z1 correctly "
+            "(range protected / no edit rights / different sheet?)."
+        )
+
+    return {
+        "sheet_title": sh.title,
+        "tab": store_tab,
+        "sa_email": sa_dict.get("client_email", ""),
+        "z1": showed,
+    }
+
 
 
 # ----------------------------
