@@ -12,19 +12,18 @@ IST = pytz.timezone("Asia/Kolkata")
 # ----------------------------
 # Page config
 # ----------------------------
-st.set_page_config(
-    page_title="nse-index-autocorrelation",
-    page_icon="📈",
-    layout="wide",
-)
+st.set_page_config(page_title="nse-index-autocorrelation", page_icon="📈", layout="wide")
+
 
 # ----------------------------
-# Helpers: secrets/env + query params compatibility
+# Helpers
 # ----------------------------
 def get_cfg(key: str, default: str | None = None) -> str | None:
     if hasattr(st, "secrets") and key in st.secrets:
-        return str(st.secrets[key])
-    return os.environ.get(key, default)
+        v = str(st.secrets[key])
+        return v.strip() if isinstance(v, str) else v
+    v = os.environ.get(key, default)
+    return v.strip() if isinstance(v, str) else v
 
 def ist_now_str() -> str:
     return dt.datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S")
@@ -41,40 +40,49 @@ def clear_query_params():
     except Exception:
         st.experimental_set_query_params()
 
-def normalize_qp_value(v):
+def normalize_qp(v):
     return v[0] if isinstance(v, (list, tuple)) else v
 
+
 # ----------------------------
-# Google Sheets helpers
+# Google Sheets
 # ----------------------------
-@st.cache_data(ttl=30, show_spinner=False)
-def _read_tokenstore_from_sheet() -> dict:
+def get_gspread_client():
+    sa_json = get_cfg("GCP_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise RuntimeError("Missing GCP_SERVICE_ACCOUNT_JSON in Streamlit secrets.")
+    sa_dict = json.loads(sa_json)
+    return gspread.service_account_from_dict(sa_dict)
+
+def upsert_worksheet(sh, title: str, rows: int = 2000, cols: int = 20):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+def ensure_headers(ws, headers: list[str]):
+    existing = ws.row_values(1)
+    if existing[: len(headers)] != headers:
+        ws.update("A1", [headers])
+
+@st.cache_data(ttl=10, show_spinner=False)
+def read_tokenstore() -> dict:
     """
     Reads ZerodhaTokenStore A1:D1:
-      A1 = API Key
-      B1 = API Secret
-      C1 = Access Token
-      D1 = Timestamp (IST) (optional)
-    Returns dict with keys: api_key, api_secret, access_token, ts, status, error
+      A1=API Key, B1=API Secret, C1=Access Token, D1=Timestamp
     """
     out = {"api_key": None, "api_secret": None, "access_token": None, "ts": None, "status": "skipped", "error": ""}
 
-    sa_json = get_cfg("GCP_SERVICE_ACCOUNT_JSON")
     gs_id = get_cfg("GSHEET_ID")
     tab = get_cfg("TOKENSTORE_TAB", "ZerodhaTokenStore")
-
-    if not sa_json or not gs_id:
-        out["status"] = "skipped"
-        out["error"] = "Missing GCP_SERVICE_ACCOUNT_JSON and/or GSHEET_ID in Streamlit Secrets."
+    if not gs_id:
+        out["error"] = "Missing GSHEET_ID in secrets."
         return out
 
     try:
-        sa_dict = json.loads(sa_json)
-        gc = gspread.service_account_from_dict(sa_dict)
+        gc = get_gspread_client()
         sh = gc.open_by_key(gs_id)
         ws = sh.worksheet(tab)
-
-        # A1:D1
         row = ws.get("A1:D1")
         if not row or not row[0]:
             out["status"] = "empty"
@@ -94,216 +102,212 @@ def _read_tokenstore_from_sheet() -> dict:
         out["error"] = str(e)
         return out
 
-def _upsert_worksheet(sh, title: str, rows: int = 2000, cols: int = 20):
-    try:
-        return sh.worksheet(title)
-    except Exception:
-        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
-
-def _ensure_headers(ws, headers: list[str]):
-    existing = ws.row_values(1)
-    if existing[: len(headers)] != headers:
-        ws.update("A1", [headers])
-
-def write_token_to_sheet(access_token: str, user_id: str = "") -> str:
+def write_token_to_sheets(access_token: str, user_id: str = "") -> str:
     """
     Updates:
-      ZerodhaTokenStore: C1 token, D1 timestamp
-      AccessTokenLog: append timestamp/token/user_id
-    Requires secrets:
-      GCP_SERVICE_ACCOUNT_JSON, GSHEET_ID, TOKENSTORE_TAB, TOKENLOG_TAB
+      - ZerodhaTokenStore: C1 token, D1 timestamp
+      - AccessTokenLog: append row
     """
-    sa_json = get_cfg("GCP_SERVICE_ACCOUNT_JSON")
     gs_id = get_cfg("GSHEET_ID")
     store_tab = get_cfg("TOKENSTORE_TAB", "ZerodhaTokenStore")
     log_tab = get_cfg("TOKENLOG_TAB", "AccessTokenLog")
 
-    if not sa_json or not gs_id:
-        return "Sheets write skipped (missing GCP_SERVICE_ACCOUNT_JSON / GSHEET_ID)."
+    if not gs_id:
+        return "Sheets write skipped (GSHEET_ID missing)."
 
-    sa_dict = json.loads(sa_json)
-    gc = gspread.service_account_from_dict(sa_dict)
+    gc = get_gspread_client()
     sh = gc.open_by_key(gs_id)
 
-    ws_store = _upsert_worksheet(sh, store_tab)
+    ws_store = upsert_worksheet(sh, store_tab)
     ws_store.update("C1:D1", [[access_token, ist_now_str()]])
 
-    ws_log = _upsert_worksheet(sh, log_tab)
-    headers = ["TimestampIST", "AccessToken", "UserID", "App"]
-    _ensure_headers(ws_log, headers)
+    ws_log = upsert_worksheet(sh, log_tab)
+    ensure_headers(ws_log, ["TimestampIST", "AccessToken", "UserID", "App"])
     ws_log.append_row([ist_now_str(), access_token, user_id, "nse-index-autocorrelation"], value_input_option="RAW")
 
-    # Bust cache so next rerun reads latest
-    _read_tokenstore_from_sheet.clear()
-    return f"Updated {store_tab} (C1/D1) and appended to {log_tab}."
+    # bust cache so the sidebar shows latest immediately
+    read_tokenstore.clear()
+    return f"Updated {store_tab} (C1/D1) + appended to {log_tab}."
+
 
 # ----------------------------
-# UI: Sidebar controls
+# Token validation
 # ----------------------------
-st.sidebar.title("🔐 Zerodha Login")
+def validate_token(api_key: str, access_token: str) -> tuple[bool, dict | None, str]:
+    try:
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        prof = kite.profile()  # raises if invalid
+        return True, prof, ""
+    except Exception as e:
+        return False, None, str(e)
 
-# Read from sheet FIRST
-sheet_data = _read_tokenstore_from_sheet()
 
-# Prefer sheet values; fallback to secrets/env
-api_key = sheet_data.get("api_key") or get_cfg("KITE_API_KEY")
-api_secret = sheet_data.get("api_secret") or get_cfg("KITE_API_SECRET")
+# ============================
+# UI
+# ============================
+st.title("📈 nse-index-autocorrelation")
+st.caption("Auth-first flow: uses latest API details & token from Google Sheet before asking for fresh login.")
 
-# Token preference:
-# 1) session_state token (if already verified/generated)
-# 2) sheet token (latest stored)
-# 3) manual override (later)
-if "kite_access_token" not in st.session_state and sheet_data.get("access_token"):
-    st.session_state["kite_access_token"] = sheet_data["access_token"]
-    st.session_state["token_source"] = "Google Sheet"
+# ---- Read sheet first
+sheet = read_tokenstore()
 
-# Buttons to control token flow
-col_a, col_b = st.sidebar.columns(2)
-with col_a:
-    if st.button("🔄 Reload from Sheet"):
-        # Force refresh read + overwrite token in session with sheet token
-        _read_tokenstore_from_sheet.clear()
-        sheet_data = _read_tokenstore_from_sheet()
-        if sheet_data.get("access_token"):
-            st.session_state["kite_access_token"] = sheet_data["access_token"]
-            st.session_state["token_source"] = "Google Sheet"
-            st.sidebar.success("Loaded latest token from sheet.")
-        else:
-            st.sidebar.warning("No access_token found in sheet.")
-with col_b:
-    if st.button("🧨 Force New Login"):
-        # Clears token so app shows login flow
-        st.session_state.pop("kite_access_token", None)
-        st.session_state.pop("token_source", None)
-        st.session_state.pop("last_request_token", None)
-        st.session_state.pop("last_logged_access_token", None)
-        st.sidebar.info("Cleared session token. Use login link to generate new one.")
+# ---- Resolve API key/secret priority: Sheet -> Secrets/env
+api_key = (sheet.get("api_key") or get_cfg("KITE_API_KEY") or "").strip()
+api_secret = (sheet.get("api_secret") or get_cfg("KITE_API_SECRET") or "").strip()
 
-st.sidebar.markdown("---")
-st.sidebar.caption("Sheet status")
-if sheet_data["status"] == "ok":
-    st.sidebar.write("✅ Read token store successfully")
-    if sheet_data.get("ts"):
-        st.sidebar.write(f"Last updated: `{sheet_data['ts']}`")
-elif sheet_data["status"] == "skipped":
-    st.sidebar.warning("Sheets read skipped")
-    st.sidebar.caption(sheet_data["error"])
-elif sheet_data["status"] == "empty":
-    st.sidebar.warning("Token store empty")
-    st.sidebar.caption(sheet_data["error"])
-else:
-    st.sidebar.error("Sheets read failed")
-    st.sidebar.caption(sheet_data["error"])
+# ---- Sidebar
+with st.sidebar:
+    st.header("🔐 Zerodha Auth")
 
-if not api_key:
-    st.sidebar.error("Missing API Key. Put it in ZerodhaTokenStore!A1 or Streamlit Secrets (KITE_API_KEY).")
-    st.stop()
+    # Status of sheet
+    st.subheader("Google Sheet Status")
+    if sheet["status"] == "ok":
+        st.success("TokenStore read OK ✅")
+        st.write(f"**Last updated:** `{sheet.get('ts') or '—'}`")
+        st.write(f"**Has API key:** {'✅' if sheet.get('api_key') else '❌'}")
+        st.write(f"**Has API secret:** {'✅' if sheet.get('api_secret') else '❌'}")
+        st.write(f"**Has access token:** {'✅' if sheet.get('access_token') else '❌'}")
+    elif sheet["status"] == "empty":
+        st.warning("TokenStore empty ⚠️")
+        st.caption(sheet["error"])
+    elif sheet["status"] == "error":
+        st.error("TokenStore read failed ❌")
+        st.caption(sheet["error"])
+    else:
+        st.info("TokenStore read skipped ℹ️")
+        st.caption(sheet["error"])
 
-# Kite instance (needs api_key always)
-kite = KiteConnect(api_key=api_key)
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔄 Reload Sheet"):
+            read_tokenstore.clear()
+            st.rerun()
+    with c2:
+        if st.button("🧨 Clear Session"):
+            for k in ["kite_access_token", "token_source", "last_request_token", "last_logged_access_token"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
-# Login link shown, but we won't force it if token works
-login_url = kite.login_url()
-st.sidebar.markdown(f"👉 **Login to Zerodha:** [{login_url}]({login_url})")
+    st.divider()
 
-st.sidebar.caption(
-    "If the token in your sheet is valid, the app will use it automatically. "
-    "Only login if it’s expired/invalid."
-)
-
-# Manual override (optional)
-st.sidebar.markdown("---")
-manual_token = st.sidebar.text_input(
-    "Access Token (optional override)",
-    value=st.session_state.get("kite_access_token", ""),
-    type="password",
-    help="Paste a token if you have one. Otherwise rely on Sheet token or login link.",
-)
-if manual_token.strip():
-    st.session_state["kite_access_token"] = manual_token.strip()
-    st.session_state["token_source"] = "Manual"
-
-# ----------------------------
-# Handle redirect back: request_token -> access_token
-# ----------------------------
-qp = get_query_params()
-request_token = normalize_qp_value(qp["request_token"]) if "request_token" in qp else None
-
-if request_token and st.session_state.get("last_request_token") != request_token:
-    st.info("✅ Detected `request_token` in URL. Generating access token…")
-
-    if not api_secret:
-        st.error("Missing API Secret. Put it in ZerodhaTokenStore!B1 or Streamlit Secrets (KITE_API_SECRET).")
+    # Login link (always visible)
+    if not api_key:
+        st.error("API key missing. Put it in ZerodhaTokenStore!A1 or Streamlit Secrets (KITE_API_KEY).")
         st.stop()
 
+    kite_for_login = KiteConnect(api_key=api_key)
+    login_url = kite_for_login.login_url()
+    st.markdown(f"👉 **Login to Zerodha:** [{login_url}]({login_url})")
+    st.caption("Only login if the current token is invalid/expired.")
+
+    st.divider()
+
+    # Manual token is now SAFE (won't overwrite unless you click button)
+    with st.expander("Manual token override (optional)", expanded=False):
+        st.text_input(
+            "Paste token here",
+            key="manual_access_token",
+            type="password",
+            placeholder="Paste access_token if you have it",
+        )
+        if st.button("Use manual token"):
+            tok = (st.session_state.get("manual_access_token") or "").strip()
+            if tok:
+                st.session_state["kite_access_token"] = tok
+                st.session_state["token_source"] = "Manual"
+                st.success("Manual token loaded into session.")
+                st.rerun()
+            else:
+                st.warning("Manual token is empty.")
+
+
+# ---- If sheet has an access token and we don't have one in session, load it
+if "kite_access_token" not in st.session_state and sheet.get("access_token"):
+    st.session_state["kite_access_token"] = sheet["access_token"]
+    st.session_state["token_source"] = "Google Sheet"
+
+# ---- Handle redirect back: request_token -> access_token
+qp = get_query_params()
+request_token = normalize_qp(qp["request_token"]) if "request_token" in qp else None
+
+if request_token and st.session_state.get("last_request_token") != request_token:
+    if not api_secret:
+        st.error("API secret missing. Put it in ZerodhaTokenStore!B1 or Streamlit Secrets (KITE_API_SECRET).")
+        st.stop()
+
+    st.info("✅ request_token detected. Generating access_token…")
     try:
-        session = kite.generate_session(request_token, api_secret=api_secret)
-        access_token = session["access_token"]
-        st.session_state["kite_access_token"] = access_token
+        kite_tmp = KiteConnect(api_key=api_key)
+        session = kite_tmp.generate_session(request_token, api_secret=api_secret)
+        new_token = (session.get("access_token") or "").strip()
+
+        if not new_token:
+            st.error("generate_session succeeded but no access_token returned (unexpected).")
+            st.stop()
+
+        # Put into session first
+        st.session_state["kite_access_token"] = new_token
         st.session_state["token_source"] = "Generated via Login"
         st.session_state["last_request_token"] = request_token
         st.session_state["token_generated_at"] = ist_now_str()
-        clear_query_params()  # prevent rerun loops
-        st.success("🎯 Access token generated and loaded into session.")
+
+        # IMPORTANT: sync widget state so it cannot overwrite the new token
+        st.session_state["manual_access_token"] = new_token
+
+        # Clear query params to avoid loops
+        clear_query_params()
+
+        st.success("🎯 New access_token generated and loaded.")
     except Exception as e:
         st.error(f"Token generation failed: {e}")
         st.stop()
 
-# ----------------------------
-# Use token if available (and validate)
-# ----------------------------
-access_token = st.session_state.get("kite_access_token")
+# ---- Validate current token
+access_token = (st.session_state.get("kite_access_token") or "").strip()
 if not access_token:
-    st.warning("No access token found yet. If ZerodhaTokenStore has one, press 'Reload from Sheet'. Otherwise login.")
+    st.warning("No access token available. Use the login link in the sidebar (or load from sheet).")
     st.stop()
 
-kite.set_access_token(access_token)
+ok, prof, err = validate_token(api_key, access_token)
 
-# ----------------------------
-# Main: Validate token first, then decide if we need login
-# ----------------------------
-st.title("📈 nse-index-autocorrelation")
-st.caption("Uses latest token from Google Sheet automatically. Generates a new token only when needed.")
+# ---- Main cards
+left, right = st.columns([2, 3], gap="large")
 
-col1, col2 = st.columns([2, 3], gap="large")
-
-with col1:
+with left:
     st.subheader("✅ Auth Status")
-    try:
-        prof = kite.profile()
-        user_name = prof.get("user_name", "—")
-        user_id = prof.get("user_id", "—")
-        st.write(f"**User:** {user_name} ({user_id})")
-        st.write("**Session:** Active ✅")
-        st.write(f"**Token source:** {st.session_state.get('token_source', '—')}")
-        if sheet_data.get("ts"):
-            st.write(f"**Sheet timestamp:** {sheet_data['ts']}")
-        if st.session_state.get("token_generated_at"):
-            st.write(f"**Generated at:** {st.session_state['token_generated_at']}")
+    st.write(f"**API key source:** {'Sheet' if sheet.get('api_key') else 'Secrets/Env'}")
+    st.write(f"**Token source:** {st.session_state.get('token_source', '—')}")
+    if sheet.get("ts"):
+        st.write(f"**Sheet token timestamp:** `{sheet['ts']}`")
+    if st.session_state.get("token_generated_at"):
+        st.write(f"**Generated at:** `{st.session_state['token_generated_at']}`")
 
-        # If token came from login/manual and differs from sheet, write it once
+    if ok:
+        st.success("Session Active ✅")
+        st.write(f"**User:** {prof.get('user_name', '—')} ({prof.get('user_id', '—')})")
+
+        # Write to Sheets only once per token
         if st.session_state.get("last_logged_access_token") != access_token:
             try:
-                msg = write_token_to_sheet(access_token, user_id=str(user_id))
+                msg = write_token_to_sheets(access_token, user_id=str(prof.get("user_id", "")))
                 st.session_state["last_logged_access_token"] = access_token
                 st.success(f"🧾 Sheets sync: {msg}")
             except Exception as e:
                 st.error(f"Sheets sync failed: {e}")
-
-    except Exception as e:
-        # Token invalid -> force user to login (but we don't block the login link)
-        st.error(f"Auth check failed (token invalid/expired): {e}")
-        st.warning("👉 Use the sidebar login link to generate a fresh token, then you’ll be redirected back here.")
-        # Also clear session token so app doesn't keep trying it
+    else:
+        st.error(f"Token invalid/expired: {err}")
+        st.warning("Use the sidebar login link to generate a fresh token.")
+        # Clear session token so we don't keep retrying a bad one
         st.session_state.pop("kite_access_token", None)
         st.session_state.pop("token_source", None)
         st.stop()
 
-with col2:
+with right:
     st.subheader("🔑 Current Access Token")
-    st.caption("Shown for convenience. Token is also stored in Google Sheet once validated/generated.")
+    st.caption("Shown for convenience. Also synced to your Google Sheet.")
     st.code(access_token, language="text")
 
-st.markdown("---")
+st.divider()
 st.header("📊 Strategy Output")
-st.info("Auth + token sheet-sync is ready. Next step: plug the 5m seasonality engine here.")
+st.info("Auth + sheet-first token flow is stable now. Next: plug in the 5m seasonality engine here.")
