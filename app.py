@@ -1063,4 +1063,4 @@ if signal is not None:
             st.caption(f"Signal log skipped: {e}")
 
 st.caption("Education-only. Autocorrelation edges are small & regime-sensitive. Expect lots of NO TRADE buckets. ✅")
-```
+
